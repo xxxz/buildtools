@@ -48,10 +48,19 @@ class Mercurial():
     def istype(self, repodir):
         return os.path.exists(os.path.join(repodir, '.hg'))
 
-    def clone(self, source, target):
+    def clone(self, source, target, revision):
         if not source.endswith('/'):
             source += '/'
-        subprocess.check_call(['hg', 'clone', '--quiet', '--noupdate', source, target])
+        if not os.path.isdir(target):
+            os.makedirs(target)
+        subprocess.check_call(['hg', 'init', target])
+        config_path = os.path.join(target, '.hg', 'hgrc')
+        config = RawConfigParser()
+        config.add_section('paths')
+        config.set('paths', 'default', source)
+        with open(config_path, 'w') as stream:
+            config.write(stream)
+        self.pull(target)
 
     def get_revision_id(self, repo, rev=None):
         command = ['hg', 'id', '--repository', repo, '--id']
@@ -95,11 +104,21 @@ class Git():
     def istype(self, repodir):
         return os.path.exists(os.path.join(repodir, '.git'))
 
-    def clone(self, source, target):
+    def clone(self, source, target, revision):
         source = source.rstrip('/')
         if not source.endswith('.git'):
             source += '.git'
-        subprocess.check_call(['git', 'clone', '--quiet', source, target])
+        if not os.path.isdir(target):
+            os.makedirs(target)
+        subprocess.check_call(['git', 'init', '--quiet'], cwd=target)
+        subprocess.check_call(['git', 'remote', 'add', 'origin', source], cwd=target)
+        self.pull(target)
+        # Manual call of update here because if the revision is the HEAD of the
+        # repository then update_repo, which is called after this clone method,
+        # cannot understand that checking out is still required and skips it.
+        # As the result there are no files.
+        resolved_revision = self.get_revision_id(target, revision)
+        self.update(target, resolved_revision, revision)
 
     def get_revision_id(self, repo, rev='HEAD'):
         command = ['git', 'rev-parse', '--revs-only', rev + '^{commit}']
@@ -245,8 +264,9 @@ def get_repo_type(repo):
     return 'hg'
 
 
-def ensure_repo(parentrepo, parenttype, target, type, root, sourcename):
-    if os.path.exists(target):
+def ensure_repo(parentrepo, parenttype, target, type, root, sourcename, revision):
+    repo = repo_types[type]
+    if repo.istype(target):
         return
 
     if SKIP_DEPENDENCY_UPDATES:
@@ -254,9 +274,8 @@ def ensure_repo(parentrepo, parenttype, target, type, root, sourcename):
                         '%s not cloned', target)
         return
 
-    postprocess_url = repo_types[type].postprocess_url
-    root = postprocess_url(root)
-    sourcename = postprocess_url(sourcename)
+    root = repo.postprocess_url(root)
+    sourcename = repo.postprocess_url(sourcename)
 
     if os.path.exists(root):
         url = os.path.join(root, sourcename)
@@ -264,7 +283,7 @@ def ensure_repo(parentrepo, parenttype, target, type, root, sourcename):
         url = urlparse.urljoin(root, sourcename)
 
     logging.info('Cloning repository %s into %s' % (url, target))
-    repo_types[type].clone(url, target)
+    repo.clone(url, target, revision)
     repo_types[parenttype].ignore(target, parentrepo)
 
 
@@ -320,7 +339,7 @@ def resolve_deps(repodir, level=0, self_update=True, overrideroots=None, skipdep
             logging.warning('No valid source / revision found to create %s' % target)
             continue
 
-        ensure_repo(repodir, parenttype, target, vcs, _root.get(vcs, ''), source)
+        ensure_repo(repodir, parenttype, target, vcs, _root.get(vcs, ''), source, rev)
         update_repo(target, vcs, rev)
         resolve_deps(target, level + 1, self_update=False,
                      overrideroots=overrideroots, skipdependencies=skipdependencies)
